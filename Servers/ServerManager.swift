@@ -1,16 +1,12 @@
-import Foundation
 import Combine
-
-extension Notification.Name {
-    static let serverSettingsDidChange = Notification.Name("serverSettingsDidChange")
-}
+import Foundation
 
 class ServerManager: ObservableObject {
     static let shared = ServerManager()
 
     @Published var serverStates: [String: ServerState] = [:]
     @Published var settings: ServerSettings?
-    @Published var configError: String?
+    @Published var configurationError: String?
     @Published var appCpuUsage: Double = 0
 
     private var healthCheckTimers: [String: Timer] = [:]
@@ -19,13 +15,14 @@ class ServerManager: ObservableObject {
     // ps can never stack up children behind it.
     private var cpuSampleInFlight = false
 
-    private func nodeEnvPath(for projectPath: String) -> String {
+    private func nodeEnvironmentPath(for projectPath: String) -> String {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let nvmDir = "\(home)/.nvm/versions/node"
+        let nvmDirectory = "\(home)/.nvm/versions/node"
 
-        guard let versions = try? FileManager.default.contentsOfDirectory(atPath: nvmDir),
-              !versions.isEmpty else {
-            // No NVM — try Homebrew (Apple Silicon and Intel)
+        guard let versions = try? FileManager.default.contentsOfDirectory(atPath: nvmDirectory),
+            !versions.isEmpty
+        else {
+            // No NVM, so try Homebrew (Apple Silicon and Intel)
             for path in ["/opt/homebrew/bin", "/usr/local/bin"] {
                 if FileManager.default.fileExists(atPath: "\(path)/node") {
                     return path
@@ -38,8 +35,9 @@ class ServerManager: ObservableObject {
 
         // Try to match package.json engines.node
         if let wanted = readEngineNode(from: projectPath),
-           nodeVersions.contains(wanted) {
-            return "\(nvmDir)/\(wanted)/bin"
+            nodeVersions.contains(wanted)
+        {
+            return "\(nvmDirectory)/\(wanted)/bin"
         }
 
         // Try .nvmrc
@@ -47,21 +45,21 @@ class ServerManager: ObservableObject {
             let version = nvmrc.trimmingCharacters(in: .whitespacesAndNewlines)
             let prefixed = version.hasPrefix("v") ? version : "v\(version)"
             if nodeVersions.contains(prefixed) {
-                return "\(nvmDir)/\(prefixed)/bin"
+                return "\(nvmDirectory)/\(prefixed)/bin"
             }
         }
 
         // Fall back to latest installed version (semver sort)
-        let sorted = nodeVersions.sorted { a, b in
-            let partsA = a.dropFirst().split(separator: ".").compactMap { Int($0) }
-            let partsB = b.dropFirst().split(separator: ".").compactMap { Int($0) }
-            for i in 0..<min(partsA.count, partsB.count) {
-                if partsA[i] != partsB[i] { return partsA[i] < partsB[i] }
+        let sorted = nodeVersions.sorted { left, right in
+            let leftParts = left.dropFirst().split(separator: ".").compactMap { Int($0) }
+            let rightParts = right.dropFirst().split(separator: ".").compactMap { Int($0) }
+            for (leftPart, rightPart) in zip(leftParts, rightParts) where leftPart != rightPart {
+                return leftPart < rightPart
             }
-            return partsA.count < partsB.count
+            return leftParts.count < rightParts.count
         }
         if let latest = sorted.last {
-            return "\(nvmDir)/\(latest)/bin"
+            return "\(nvmDirectory)/\(latest)/bin"
         }
 
         return "/usr/local/bin:/usr/bin"
@@ -70,9 +68,10 @@ class ServerManager: ObservableObject {
     private func readEngineNode(from projectPath: String) -> String? {
         let packageJsonPath = "\(projectPath)/package.json"
         guard let data = FileManager.default.contents(atPath: packageJsonPath),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let engines = json["engines"] as? [String: String],
-              let node = engines["node"] else {
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let engines = json["engines"] as? [String: String],
+            let node = engines["node"]
+        else {
             return nil
         }
         // Ensure it has the "v" prefix
@@ -83,8 +82,9 @@ class ServerManager: ObservableObject {
         if let loaded = ServerSettings.load() {
             self.settings = loaded
             setupServers()
-        } else {
-            self.configError = "Failed to load ~/.servers/settings.json"
+        }
+        else {
+            self.configurationError = "Failed to load ~/.servers/settings.json"
         }
         startCpuMonitor()
     }
@@ -100,7 +100,10 @@ class ServerManager: ObservableObject {
 
     private func startCpuMonitor() {
         cpuMonitorTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
-            self?.sampleCpuUsage()
+            // Scheduled from the main actor, so the timer fires on the main run loop.
+            MainActor.assumeIsolated {
+                self?.sampleCpuUsage()
+            }
         }
     }
 
@@ -108,12 +111,14 @@ class ServerManager: ObservableObject {
         guard !cpuSampleInFlight else { return }
 
         // Collect all PIDs we care about (running servers + self)
-        var pidToServerId: [pid_t: String] = [:]
-        for (id, state) in serverStates where state.pid > 0 && state.status == .running {
-            pidToServerId[state.pid] = id
-        }
+        let serverIdsByPid = Dictionary(
+            serverStates.compactMap { id, state in
+                state.pid > 0 && state.status == .running ? (state.pid, id) : nil
+            },
+            uniquingKeysWith: { _, later in later },
+        )
 
-        guard !pidToServerId.isEmpty else {
+        guard !serverIdsByPid.isEmpty else {
             // Still sample app CPU even with no servers running
             sampleAppCpu()
             return
@@ -122,106 +127,112 @@ class ServerManager: ObservableObject {
         // Use ps to get CPU for all processes, then sum by process tree
         cpuSampleInFlight = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self = self else { return }
+            guard let self else { return }
 
-            // Get all processes with pid, ppid, %cpu. The table runs to tens of kilobytes on a
-            // busy Mac, past the pipe buffer, which is why this goes through HelperCommand.
-            guard let data = HelperCommand.output("/bin/ps", arguments: ["-eo", "pid,ppid,%cpu"]),
-                  let output = String(data: data, encoding: .utf8) else {
-                DispatchQueue.main.async { self.cpuSampleInFlight = false }
-                return
-            }
-
-            // Parse ps output into (pid, ppid, cpu) tuples
-            struct PsEntry {
-                let pid: pid_t
-                let ppid: pid_t
-                let cpu: Double
-            }
-
-            var entries: [PsEntry] = []
-            let appPid = ProcessInfo.processInfo.processIdentifier
-
-            for line in output.components(separatedBy: "\n").dropFirst() {
-                let parts = line.trimmingCharacters(in: .whitespaces)
-                    .components(separatedBy: .whitespaces)
-                    .filter { !$0.isEmpty }
-                guard parts.count >= 3,
-                      let pid = Int32(parts[0]),
-                      let ppid = Int32(parts[1]),
-                      let cpu = Double(parts[2]) else { continue }
-                entries.append(PsEntry(pid: pid, ppid: ppid, cpu: cpu))
-            }
-
-            // Build parent -> children map
-            var childrenOf: [pid_t: [pid_t]] = [:]
-            var cpuOf: [pid_t: Double] = [:]
-            for e in entries {
-                childrenOf[e.ppid, default: []].append(e.pid)
-                cpuOf[e.pid] = e.cpu
-            }
-
-            // Sum CPU for a process tree rooted at `root`
-            func treeCpu(_ root: pid_t) -> Double {
-                var total = cpuOf[root] ?? 0
-                for child in childrenOf[root] ?? [] {
-                    total += treeCpu(child)
-                }
-                return total
-            }
-
-            // Calculate per-server CPU
-            var results: [String: Double] = [:]
-            for (pid, serverId) in pidToServerId {
-                results[serverId] = treeCpu(pid)
-            }
-
-            // App CPU (just this process, not its children which are the servers)
-            let selfCpu = cpuOf[appPid] ?? 0
+            let sample = ServerManager.processTreeCpuSample(serverIdsByPid: serverIdsByPid)
 
             DispatchQueue.main.async {
                 self.cpuSampleInFlight = false
-                for (serverId, cpu) in results {
+                guard let sample else { return }
+                for (serverId, cpu) in sample.serverCpuUsage {
                     self.serverStates[serverId]?.cpuUsage = cpu
                 }
                 // Zero out stopped servers
                 for (_, state) in self.serverStates where state.status != .running {
                     state.cpuUsage = 0
                 }
-                self.appCpuUsage = selfCpu
+                self.appCpuUsage = sample.appCpuUsage
                 self.objectWillChange.send()
             }
         }
     }
 
+    /// CPU percentages from one `ps` pass: each server's whole process tree, and this app alone.
+    private nonisolated struct ProcessTreeCpuSample {
+        let serverCpuUsage: [String: Double]
+        let appCpuUsage: Double
+    }
+
+    /// Runs `ps` once, off the main thread, and sums CPU over each server's process tree.
+    /// Nil when `ps` couldn't launch or ran past its deadline.
+    private nonisolated static func processTreeCpuSample(serverIdsByPid: [pid_t: String]) -> ProcessTreeCpuSample? {
+        // Get all processes with pid, ppid, %cpu. The table runs to tens of kilobytes on a
+        // busy Mac, past the pipe buffer, which is why this goes through HelperCommand.
+        guard let data = HelperCommand.output("/bin/ps", arguments: ["-eo", "pid,ppid,%cpu"]),
+            let output = String(data: data, encoding: .utf8)
+        else {
+            return nil
+        }
+
+        // Parse ps output into a parent -> children map and each process's own CPU
+        var childrenOf: [pid_t: [pid_t]] = [:]
+        var cpuOf: [pid_t: Double] = [:]
+        for line in output.components(separatedBy: "\n").dropFirst() {
+            let parts = line.trimmingCharacters(in: .whitespaces)
+                .components(separatedBy: .whitespaces)
+                .filter { !$0.isEmpty }
+            guard parts.count >= 3,
+                let pid = Int32(parts[0]),
+                let parentPid = Int32(parts[1]),
+                let cpu = Double(parts[2])
+            else { continue }
+            childrenOf[parentPid, default: []].append(pid)
+            cpuOf[pid] = cpu
+        }
+
+        // Sum CPU for a process tree rooted at `root`
+        func treeCpu(_ root: pid_t) -> Double {
+            var total = cpuOf[root] ?? 0
+            for child in childrenOf[root] ?? [] {
+                total += treeCpu(child)
+            }
+            return total
+        }
+
+        // App CPU is just this process, not its children, which are the servers
+        return ProcessTreeCpuSample(
+            serverCpuUsage: Dictionary(
+                serverIdsByPid.map { pid, serverId in (serverId, treeCpu(pid)) },
+                uniquingKeysWith: { _, later in later },
+            ),
+            appCpuUsage: cpuOf[ProcessInfo.processInfo.processIdentifier] ?? 0,
+        )
+    }
+
     private func sampleAppCpu() {
         cpuSampleInFlight = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let appPid = ProcessInfo.processInfo.processIdentifier
-            var cpu: Double?
-            if let data = HelperCommand.output("/bin/ps", arguments: ["-p", "\(appPid)", "-o", "%cpu"]),
-               let output = String(data: data, encoding: .utf8),
-               let line = output.components(separatedBy: "\n").dropFirst().first {
-                cpu = Double(line.trimmingCharacters(in: .whitespaces))
-            }
+            let cpu = ServerManager.sampleOwnCpuUsage()
 
             DispatchQueue.main.async {
                 self?.cpuSampleInFlight = false
-                if let cpu = cpu {
+                if let cpu {
                     self?.appCpuUsage = cpu
                 }
             }
         }
     }
 
+    /// This app's own CPU from `ps`, off the main thread. Nil when `ps` failed or printed no number.
+    private nonisolated static func sampleOwnCpuUsage() -> Double? {
+        let appPid = ProcessInfo.processInfo.processIdentifier
+        guard let data = HelperCommand.output("/bin/ps", arguments: ["-p", "\(appPid)", "-o", "%cpu"]),
+            let output = String(data: data, encoding: .utf8),
+            let line = output.components(separatedBy: "\n").dropFirst().first
+        else {
+            return nil
+        }
+        return Double(line.trimmingCharacters(in: .whitespaces))
+    }
+
     func reloadSettings() {
         guard let loaded = ServerSettings.load() else {
-            configError = "Failed to load ~/.servers/settings.json"
+            configurationError = "Failed to load ~/.servers/settings.json"
             return
         }
 
         settings = loaded
-        configError = nil
+        configurationError = nil
 
         // Find removed servers and stop them
         let newIds = Set(loaded.servers.map { $0.id })
@@ -276,26 +287,34 @@ class ServerManager: ObservableObject {
         if let port = state.server.port {
             let killed = killProcessesOnPort(port)
             if !killed.isEmpty {
-                state.appendLog("[system] Killed \(killed.count) process(es) holding port \(port): PIDs \(killed.map { String($0) }.joined(separator: ", "))")
+                state.appendLog(
+                    "[system] Killed \(killed.count) process(es) holding port \(port): PIDs \(killed.map { String($0) }.joined(separator: ", "))"
+                )
             }
         }
 
         // Remove stale lock files for Next.js
         let lockPath = state.server.expandedPath + "/.next/dev/lock"
-        try? FileManager.default.removeItem(atPath: lockPath)
+        do {
+            try FileManager.default.removeItem(atPath: lockPath)
+        }
+        catch {
+            // Usually there is no lock to remove. One that won't go surfaces in the log as the
+            // dev server's own error when it starts.
+        }
 
         let process = Process()
         process.currentDirectoryURL = URL(fileURLWithPath: state.server.expandedPath)
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
 
         // Build command with proper PATH
-        let nodePath = nodeEnvPath(for: state.server.expandedPath)
+        let nodePath = nodeEnvironmentPath(for: state.server.expandedPath)
         let fullCommand = "export PATH=\(nodePath):$PATH && exec \(state.server.command)"
         process.arguments = ["-c", fullCommand]
 
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "\(nodePath):" + (env["PATH"] ?? "")
-        env["FORCE_COLOR"] = "1"  // Keep colors in output
+        env["FORCE_COLOR"] = "1" // Keep colors in output
         process.environment = env
 
         // Setup pipes for stdout/stderr capture
@@ -320,11 +339,13 @@ class ServerManager: ObservableObject {
                 if state.stoppingIntentionally {
                     state.stoppingIntentionally = false
                     state.status = .stopped
-                } else if exitCode != 0 {
+                }
+                else if exitCode != 0 {
                     state.status = .crashed
                     state.lastError = "Exit code: \(exitCode)"
                     self.handleCrash(state: state)
-                } else {
+                }
+                else {
                     state.status = .stopped
                 }
 
@@ -342,7 +363,8 @@ class ServerManager: ObservableObject {
             // Start health checks if port is configured
             startHealthCheck(for: state)
 
-        } catch {
+        }
+        catch {
             state.status = .crashed
             state.lastError = error.localizedDescription
             state.appendLog("[system] Failed to start: \(error.localizedDescription)")
@@ -361,15 +383,18 @@ class ServerManager: ObservableObject {
         state.inCooldown = false
         state.crashTimes.removeAll()
 
-        if state.pid > 0 {
+        // Captured before the state is cleared below, so the fallback still knows what to kill.
+        // Each server is its own process group leader, so the group holds its whole tree.
+        let processGroup = state.pid
+        if processGroup > 0 {
             // Kill the process group
-            kill(-state.pid, SIGTERM)
+            kill(-processGroup, SIGTERM)
 
-            // Give it a moment to terminate gracefully
+            // Anything in the group still alive a second later ignored the polite ask. Judged by
+            // the group, not the leader: the leader can exit while its children linger. An empty
+            // group just answers `ESRCH`.
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-                if state.process?.isRunning == true {
-                    kill(-state.pid, SIGKILL)
-                }
+                kill(-processGroup, SIGKILL)
             }
         }
 
@@ -432,7 +457,7 @@ class ServerManager: ObservableObject {
             state.status = .stopped
         }
 
-        // Delay for SIGKILL to propagate
+        // Delay for `SIGKILL` to propagate
         Thread.sleep(forTimeInterval: 0.5)
 
         // Kill any remaining processes on ports using direct PIDs
@@ -448,7 +473,8 @@ class ServerManager: ObservableObject {
     private func killProcessesOnPort(_ port: Int) -> [Int32] {
         // Get PIDs using lsof synchronously. No output (nothing on the port, or lsof failed) is fine.
         guard let data = HelperCommand.output("/usr/sbin/lsof", arguments: ["-ti", ":\(port)"]),
-              let output = String(data: data, encoding: .utf8) else {
+            let output = String(data: data, encoding: .utf8)
+        else {
             return []
         }
 
@@ -481,7 +507,7 @@ class ServerManager: ObservableObject {
             isHealthy: state.isHealthy,
             port: state.server.port,
             lastError: state.lastError,
-            cpuUsage: state.status == .running ? state.cpuUsage : nil
+            cpuUsage: state.status == .running ? state.cpuUsage : nil,
         )
     }
 
@@ -510,7 +536,7 @@ class ServerManager: ObservableObject {
                     buffer = buffer[(newlineIndex + 1)...]
 
                     if let line = String(data: lineData, encoding: .utf8) {
-                        let cleanLine = self.stripAnsiCodes(line)
+                        let cleanLine = ServerManager.strippingAnsiCodes(line)
                         DispatchQueue.main.async {
                             state.appendLog(prefix + cleanLine)
                         }
@@ -520,7 +546,7 @@ class ServerManager: ObservableObject {
 
             // Handle any remaining data without newline
             if !buffer.isEmpty, let line = String(data: buffer, encoding: .utf8) {
-                let cleanLine = self.stripAnsiCodes(line)
+                let cleanLine = ServerManager.strippingAnsiCodes(line)
                 DispatchQueue.main.async {
                     state.appendLog(prefix + cleanLine)
                 }
@@ -528,7 +554,7 @@ class ServerManager: ObservableObject {
         }
     }
 
-    private func stripAnsiCodes(_ string: String) -> String {
+    private nonisolated static func strippingAnsiCodes(_ string: String) -> String {
         // Remove ANSI escape codes for cleaner logs
         let pattern = "\\x1B\\[[0-9;]*[a-zA-Z]"
         return string.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
@@ -553,7 +579,7 @@ class ServerManager: ObservableObject {
             now.timeIntervalSince($0) < state.crashWindowSeconds
         }
 
-        if state.crashTimes.count >= state.maxCrashesBeforeCooldown {
+        if state.crashTimes.count >= state.maximumCrashesBeforeCooldown {
             state.inCooldown = true
             state.status = .cooldown
             state.appendLog("[system] Too many crashes - cooldown for \(Int(state.cooldownSeconds/60)) minutes")
@@ -570,7 +596,9 @@ class ServerManager: ObservableObject {
             return
         }
 
-        state.appendLog("[system] Crashed - restarting (\(state.crashTimes.count)/\(state.maxCrashesBeforeCooldown))")
+        state.appendLog(
+            "[system] Crashed - restarting (\(state.crashTimes.count)/\(state.maximumCrashesBeforeCooldown))"
+        )
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self, weak state] in
             guard let self = self, let state = state, !state.inCooldown else { return }
@@ -586,8 +614,11 @@ class ServerManager: ObservableObject {
         stopHealthCheck(for: state)
 
         let timer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self, weak state] _ in
-            guard let state = state else { return }
-            self?.checkHealth(state: state, port: port)
+            // Scheduled from the main actor, so the timer fires on the main run loop.
+            MainActor.assumeIsolated {
+                guard let state else { return }
+                self?.checkHealth(state: state, port: port)
+            }
         }
 
         healthCheckTimers[state.server.id] = timer
@@ -610,58 +641,60 @@ class ServerManager: ObservableObject {
         let hostname = state.server.hostname
 
         DispatchQueue.global(qos: .utility).async {
-            var hints = addrinfo()
-            hints.ai_family = AF_UNSPEC  // Allow both IPv4 and IPv6
-            hints.ai_socktype = SOCK_STREAM
-
-            var result: UnsafeMutablePointer<addrinfo>?
-            let status = getaddrinfo(hostname, String(port), &hints, &result)
-
-            guard status == 0, let addrInfo = result else {
-                DispatchQueue.main.async { state.isHealthy = false }
-                return
-            }
-            defer { freeaddrinfo(result) }
-
-            // Try each resolved address until one connects
-            var info: UnsafeMutablePointer<addrinfo>? = addrInfo
-            var connected = false
-
-            while let ai = info {
-                let sock = socket(ai.pointee.ai_family, ai.pointee.ai_socktype, ai.pointee.ai_protocol)
-                if sock >= 0 {
-                    // Set socket timeout
-                    var timeout = timeval(tv_sec: 2, tv_usec: 0)
-                    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-
-                    if connect(sock, ai.pointee.ai_addr, ai.pointee.ai_addrlen) == 0 {
-                        connected = true
-                        close(sock)
-                        break
-                    }
-                    close(sock)
-                }
-                info = ai.pointee.ai_next
-            }
+            let connected = ServerManager.acceptsConnection(hostname: hostname, port: port)
 
             DispatchQueue.main.async {
                 state.isHealthy = connected
             }
         }
     }
-}
 
-// MARK: - SSL Delegate for self-signed certs
+    /// Whether a TCP connection to the host and port succeeds on any address it resolves to.
+    ///
+    /// The socket calls take and hand back C pointers, so each is marked unsafe where it touches
+    /// one. The `addrinfo` list lives from `getaddrinfo` until the deferred `freeaddrinfo`, and no
+    /// pointer into it is kept past this function.
+    private nonisolated static func acceptsConnection(hostname: String, port: Int) -> Bool {
+        var hints = unsafe addrinfo()
+        unsafe hints.ai_family = AF_UNSPEC // Allow both IPv4 and IPv6
+        unsafe hints.ai_socktype = SOCK_STREAM
 
-class InsecureSSLDelegate: NSObject, URLSessionDelegate {
-    static let shared = InsecureSSLDelegate()
-
-    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
-        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-           let serverTrust = challenge.protectionSpace.serverTrust {
-            completionHandler(.useCredential, URLCredential(trust: serverTrust))
-        } else {
-            completionHandler(.performDefaultHandling, nil)
+        var result: UnsafeMutablePointer<addrinfo>?
+        guard unsafe getaddrinfo(hostname, String(port), &hints, &result) == 0,
+            let firstAddress = unsafe result
+        else {
+            return false
         }
+        defer { unsafe freeaddrinfo(result) }
+
+        // Try each resolved address until one connects
+        var candidate = unsafe Optional(firstAddress)
+        while let address = unsafe candidate {
+            let socketDescriptor = unsafe socket(
+                address.pointee.ai_family,
+                address.pointee.ai_socktype,
+                address.pointee.ai_protocol,
+            )
+            if socketDescriptor >= 0 {
+                // Set socket timeout
+                var timeout = timeval(tv_sec: 2, tv_usec: 0)
+                unsafe setsockopt(
+                    socketDescriptor,
+                    SOL_SOCKET,
+                    SO_SNDTIMEO,
+                    &timeout,
+                    socklen_t(MemoryLayout<timeval>.size),
+                )
+
+                let connected =
+                    unsafe connect(socketDescriptor, address.pointee.ai_addr, address.pointee.ai_addrlen) == 0
+                close(socketDescriptor)
+                if connected {
+                    return true
+                }
+            }
+            unsafe candidate = address.pointee.ai_next
+        }
+        return false
     }
 }

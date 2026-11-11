@@ -1,24 +1,8 @@
 import AppKit
-import SwiftUI
 import Combine
+import SwiftUI
 
 // MARK: - Window State Persistence (multi-monitor aware)
-
-extension NSScreen {
-    var displayID: CGDirectDisplayID {
-        let key = NSDeviceDescriptionKey("NSScreenNumber")
-        return deviceDescription[key] as! CGDirectDisplayID
-    }
-
-    /// Stable identifier using localizedName + frame as a fingerprint
-    var screenIdentifier: String {
-        return "\(localizedName)_\(frame.width)x\(frame.height)"
-    }
-
-    static func screen(forIdentifier id: String) -> NSScreen? {
-        return NSScreen.screens.first { $0.screenIdentifier == id }
-    }
-}
 
 struct SavedWindowState: Codable {
     let frameX: Double
@@ -31,14 +15,17 @@ struct SavedWindowState: Codable {
     let screenFrameWidth: Double
     let screenFrameHeight: Double
 
-    init(window: NSWindow) {
+    /// Nil when the window is on no screen and there is no main screen either, so there's no
+    /// screen to remember it against.
+    init?(window: NSWindow) {
+        guard let screen = window.screen ?? NSScreen.main else { return nil }
+
         let frame = window.frame
         self.frameX = frame.origin.x
         self.frameY = frame.origin.y
         self.frameWidth = frame.size.width
         self.frameHeight = frame.size.height
 
-        let screen = window.screen ?? NSScreen.main!
         self.screenID = screen.screenIdentifier
 
         let screenFrame = screen.visibleFrame
@@ -53,20 +40,26 @@ enum WindowStateManager {
     private static let keyPrefix = "WindowState_"
 
     static func save(window: NSWindow, name: String) {
-        let state = SavedWindowState(window: window)
-        if let data = try? JSONEncoder().encode(state) {
+        if let state = SavedWindowState(window: window),
+            let data = try? JSONEncoder().encode(state)
+        {
             UserDefaults.standard.set(data, forKey: keyPrefix + name)
         }
     }
 
     static func restore(window: NSWindow, name: String) -> Bool {
         guard let data = UserDefaults.standard.data(forKey: keyPrefix + name),
-              let state = try? JSONDecoder().decode(SavedWindowState.self, from: data) else {
+            let state = try? JSONDecoder().decode(SavedWindowState.self, from: data)
+        else {
             return false
         }
 
-        let savedFrame = NSRect(x: state.frameX, y: state.frameY,
-                                width: state.frameWidth, height: state.frameHeight)
+        let savedFrame = NSRect(
+            x: state.frameX,
+            y: state.frameY,
+            width: state.frameWidth,
+            height: state.frameHeight,
+        )
 
         // Try exact screen by identifier (name + resolution)
         if let targetScreen = NSScreen.screen(forIdentifier: state.screenID) {
@@ -88,7 +81,7 @@ enum WindowStateManager {
                 x: vis.midX - savedFrame.width / 2,
                 y: vis.midY - savedFrame.height / 2,
                 width: savedFrame.width,
-                height: savedFrame.height
+                height: savedFrame.height,
             )
             window.setFrame(centered, display: true)
             return true
@@ -98,33 +91,39 @@ enum WindowStateManager {
     }
 
     private static func adjustFrame(_ saved: NSRect, from state: SavedWindowState, to screen: NSScreen) -> NSRect {
-        let oldScreen = NSRect(x: state.screenFrameX, y: state.screenFrameY,
-                               width: state.screenFrameWidth, height: state.screenFrameHeight)
-        let cur = screen.visibleFrame
+        let oldScreen = NSRect(
+            x: state.screenFrameX,
+            y: state.screenFrameY,
+            width: state.screenFrameWidth,
+            height: state.screenFrameHeight,
+        )
+        let current = screen.visibleFrame
 
-        if NSEqualRects(oldScreen, cur) { return saved }
+        // Both are visible frames of real screens, never empty or negative, so Swift's
+        // standardized comparison and intersection agree with the C functions here.
+        if oldScreen == current { return saved }
 
-        let relX = (saved.origin.x - oldScreen.origin.x) / oldScreen.width
-        let relY = (saved.origin.y - oldScreen.origin.y) / oldScreen.height
+        let relativeX = (saved.origin.x - oldScreen.origin.x) / oldScreen.width
+        let relativeY = (saved.origin.y - oldScreen.origin.y) / oldScreen.height
 
-        var f = saved
-        f.origin.x = cur.origin.x + relX * cur.width
-        f.origin.y = cur.origin.y + relY * cur.height
-        f.size.width = min(f.size.width, cur.width)
-        f.size.height = min(f.size.height, cur.height)
+        var adjusted = saved
+        adjusted.origin.x = current.origin.x + relativeX * current.width
+        adjusted.origin.y = current.origin.y + relativeY * current.height
+        adjusted.size.width = min(adjusted.size.width, current.width)
+        adjusted.size.height = min(adjusted.size.height, current.height)
 
         // Clamp on-screen
-        if f.maxX > cur.maxX { f.origin.x = cur.maxX - f.size.width }
-        if f.maxY > cur.maxY { f.origin.y = cur.maxY - f.size.height }
-        if f.origin.x < cur.origin.x { f.origin.x = cur.origin.x }
-        if f.origin.y < cur.origin.y { f.origin.y = cur.origin.y }
+        if adjusted.maxX > current.maxX { adjusted.origin.x = current.maxX - adjusted.size.width }
+        if adjusted.maxY > current.maxY { adjusted.origin.y = current.maxY - adjusted.size.height }
+        if adjusted.origin.x < current.origin.x { adjusted.origin.x = current.origin.x }
+        if adjusted.origin.y < current.origin.y { adjusted.origin.y = current.origin.y }
 
-        return f
+        return adjusted
     }
 
     private static func frameIsVisible(_ frame: NSRect) -> Bool {
         for screen in NSScreen.screens {
-            let intersection = NSIntersectionRect(frame, screen.visibleFrame)
+            let intersection = frame.intersection(screen.visibleFrame)
             let area = frame.width * frame.height
             if area > 0 && (intersection.width * intersection.height) / area > 0.5 {
                 return true
@@ -138,7 +137,10 @@ enum WindowStateManager {
 
 class LogWindowController {
     private static var windows: [String: NSWindow] = [:]
-    private static var cancellables: [String: AnyCancellable] = [:]
+
+    /// One delegate for every log window. `NSWindow.delegate` is weak, so this keeps it alive,
+    /// and it finds the server for a window by looking the window up in `windows`.
+    private static let windowDelegate = WindowDelegate()
 
     static func show(serverId: String, manager: ServerManager) {
         // If window already exists, bring it to front
@@ -151,13 +153,13 @@ class LogWindowController {
         guard let state = manager.serverStates[serverId] else { return }
 
         let server = state.server
-        let openBrowser: (() -> Void)? = server.port != nil ? {
-            let scheme = server.useHttps ? "https" : "http"
-            let hostname = server.hostname
-            if let url = URL(string: "\(scheme)://\(hostname):\(server.port!)") {
-                NSWorkspace.shared.open(url)
-            }
-        } : nil
+        let openBrowser: (() -> Void)? =
+            server.port != nil
+            ? {
+                if let url = server.browserUrl {
+                    NSWorkspace.shared.open(url)
+                }
+            } : nil
 
         let apiPort = manager.settings?.resolvedApiPort ?? 7378
         let logView = LogView(
@@ -168,7 +170,7 @@ class LogWindowController {
             onOpenBrowser: openBrowser,
             onCopyInstructions: {
                 ServerInstructions.copyToClipboard(for: server, apiPort: apiPort)
-            }
+            },
         )
         let hostingController = NSHostingController(rootView: logView)
 
@@ -181,7 +183,8 @@ class LogWindowController {
             let x = screenFrame.origin.x + (screenFrame.width - width) / 2
             let y = screenFrame.origin.y + (screenFrame.height - height) / 2
             defaultFrame = NSRect(x: x, y: y, width: width, height: height)
-        } else {
+        }
+        else {
             defaultFrame = NSRect(x: 0, y: 0, width: 900, height: 600)
         }
 
@@ -190,17 +193,12 @@ class LogWindowController {
             contentRect: defaultFrame,
             styleMask: [.titled, .closable, .resizable, .miniaturizable],
             backing: .buffered,
-            defer: false
+            defer: false,
         )
 
         window.minSize = NSSize(width: 600, height: 400)
 
-        var title = state.server.name
-        if let port = server.port {
-            let scheme = server.useHttps ? "https" : "http"
-            title += " — \(scheme)://\(server.hostname):\(port)"
-        }
-        window.title = title
+        window.title = server.browserUrl.map { "\(server.name) (\($0.absoluteString))" } ?? server.name
         window.contentViewController = hostingController
         window.isReleasedWhenClosed = false
 
@@ -208,9 +206,7 @@ class LogWindowController {
         _ = WindowStateManager.restore(window: window, name: "LogWindow_\(serverId)")
 
         // Handle window close + save state on move/resize
-        let delegate = WindowDelegate(serverId: serverId)
-        window.delegate = delegate
-        objc_setAssociatedObject(window, "delegate", delegate, .OBJC_ASSOCIATION_RETAIN)
+        window.delegate = windowDelegate
 
         windows[serverId] = window
         window.makeKeyAndOrderFront(nil)
@@ -222,38 +218,46 @@ class LogWindowController {
     static func close(serverId: String) {
         windows[serverId]?.close()
         windows.removeValue(forKey: serverId)
-        cancellables.removeValue(forKey: serverId)
         updateDockIconVisibility()
     }
 
     static func updateDockIconVisibility() {
         if windows.isEmpty && !SettingsWindowController.isOpen {
             NSApp.setActivationPolicy(.accessory)
-        } else {
+        }
+        else {
             NSApp.setActivationPolicy(.regular)
         }
     }
 
     private class WindowDelegate: NSObject, NSWindowDelegate {
-        let serverId: String
-
-        init(serverId: String) {
-            self.serverId = serverId
-        }
-
-        private func saveState(_ notification: Notification) {
-            if let window = notification.object as? NSWindow {
-                WindowStateManager.save(window: window, name: "LogWindow_\(serverId)")
+        /// The window posting the notification and the server it shows logs for.
+        private func logWindow(_ notification: Notification) -> (window: NSWindow, serverId: String)? {
+            guard let window = notification.object as? NSWindow,
+                let serverId = LogWindowController.windows.first(where: { $0.value === window })?.key
+            else {
+                return nil
             }
+            return (window, serverId)
         }
 
-        func windowDidMove(_ notification: Notification) { saveState(notification) }
-        func windowDidResize(_ notification: Notification) { saveState(notification) }
+        private func saveState(_ logWindow: (window: NSWindow, serverId: String)) {
+            WindowStateManager.save(window: logWindow.window, name: "LogWindow_\(logWindow.serverId)")
+        }
+
+        func windowDidMove(_ notification: Notification) {
+            if let logWindow = logWindow(notification) { saveState(logWindow) }
+        }
+
+        func windowDidResize(_ notification: Notification) {
+            if let logWindow = logWindow(notification) { saveState(logWindow) }
+        }
 
         func windowWillClose(_ notification: Notification) {
-            saveState(notification)
-            LogWindowController.windows.removeValue(forKey: serverId)
-            LogWindowController.cancellables.removeValue(forKey: serverId)
+            if let logWindow = logWindow(notification) {
+                saveState(logWindow)
+                LogWindowController.windows.removeValue(forKey: logWindow.serverId)
+            }
             LogWindowController.updateDockIconVisibility()
         }
     }
@@ -284,7 +288,7 @@ struct LogView: View {
                     onRestart: onRestart,
                     onOpenBrowser: onOpenBrowser,
                     onCopyInstructions: onCopyInstructions,
-                    size: .medium
+                    size: .medium,
                 )
 
                 Spacer()
@@ -342,7 +346,7 @@ struct LogView: View {
                 searchText: searchText,
                 autoScroll: autoScroll,
                 showTimestamps: showTimestamps,
-                timestamps: filteredTimestamps
+                timestamps: filteredTimestamps,
             )
 
             Divider()
@@ -366,7 +370,7 @@ struct LogView: View {
                     HStack(spacing: 3) {
                         Image(systemName: "cpu")
                             .font(.system(size: 10))
-                        Text(cpu < 10 ? String(format: "%.1f%%", cpu) : String(format: "%.0f%%", cpu))
+                        Text(CpuPercentText.adaptive(cpu))
                             .font(.system(size: 11, design: .monospaced))
                     }
                     .foregroundColor(cpu > 100 ? .red : cpu > 50 ? .orange : .secondary)
@@ -422,9 +426,9 @@ struct LogTextView: NSViewRepresentable {
     let timestamps: [Date]
 
     private static let timestampFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "HH:mm:ss.SSS"
-        return f
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        return formatter
     }()
 
     func makeCoordinator() -> Coordinator {
@@ -434,12 +438,14 @@ struct LogTextView: NSViewRepresentable {
     class Coordinator: NSObject {
         var wasAtBottom = true
         var isFirstUpdate = true
-        var observation: NSObjectProtocol?
+        var observation: (any NSObjectProtocol)?
     }
 
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = NSTextView.scrollableTextView()
-        let textView = scrollView.documentView as! NSTextView
+        // `scrollableTextView()` always builds its document view as a text view. Were that ever
+        // to change, the window shows an empty scroll view instead of crashing.
+        guard let textView = scrollView.documentView as? NSTextView else { return scrollView }
 
         textView.isEditable = false
         textView.isSelectable = true
@@ -454,16 +460,21 @@ struct LogTextView: NSViewRepresentable {
 
         // Re-scroll to bottom on resize if we were at bottom
         scrollView.contentView.postsBoundsChangedNotifications = true
-        context.coordinator.observation = NotificationCenter.default.addObserver(
+        let coordinator = context.coordinator
+        coordinator.observation = NotificationCenter.default.addObserver(
             forName: NSView.frameDidChangeNotification,
             object: scrollView.contentView,
-            queue: .main
-        ) { [weak scrollView] _ in
-            guard let scrollView = scrollView,
-                  let textView = scrollView.documentView as? NSTextView else { return }
-            let coord = context.coordinator
-            if coord.wasAtBottom {
-                textView.scrollToEndOfDocument(nil)
+            queue: .main,
+        ) { [weak scrollView, weak coordinator] _ in
+            // Registered on the main queue, so it's delivered there.
+            MainActor.assumeIsolated {
+                guard let scrollView,
+                    let coordinator,
+                    let textView = scrollView.documentView as? NSTextView
+                else { return }
+                if coordinator.wasAtBottom {
+                    textView.scrollToEndOfDocument(nil)
+                }
             }
         }
 
@@ -475,23 +486,27 @@ struct LogTextView: NSViewRepresentable {
 
         let attributedString = NSMutableAttributedString()
         let defaultFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        let lineNumFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+        let lineNumberFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
 
         for (index, line) in logs.enumerated() {
-            // Line number (inline, not selectable-looking)
-            let lineNum = String(format: "%4d  ", index + 1)
-            attributedString.append(NSAttributedString(
-                string: lineNum,
-                attributes: [.font: lineNumFont, .foregroundColor: NSColor.tertiaryLabelColor]
-            ))
+            // Line number (inline, not selectable-looking), right-aligned in four columns
+            let lineNumber = String(index + 1)
+            attributedString.append(
+                NSAttributedString(
+                    string: String(repeating: " ", count: max(0, 4 - lineNumber.count)) + lineNumber + "  ",
+                    attributes: [.font: lineNumberFont, .foregroundColor: NSColor.tertiaryLabelColor],
+                )
+            )
 
             // Timestamp
             if showTimestamps && index < timestamps.count {
                 let ts = Self.timestampFormatter.string(from: timestamps[index])
-                attributedString.append(NSAttributedString(
-                    string: "\(ts)  ",
-                    attributes: [.font: defaultFont, .foregroundColor: NSColor.tertiaryLabelColor]
-                ))
+                attributedString.append(
+                    NSAttributedString(
+                        string: "\(ts)  ",
+                        attributes: [.font: defaultFont, .foregroundColor: NSColor.tertiaryLabelColor],
+                    )
+                )
             }
 
             // Line content with color + search highlighting
@@ -501,7 +516,7 @@ struct LogTextView: NSViewRepresentable {
                 let fullLine = line + "\n"
                 let mutableLine = NSMutableAttributedString(
                     string: fullLine,
-                    attributes: [.font: defaultFont, .foregroundColor: color]
+                    attributes: [.font: defaultFont, .foregroundColor: color],
                 )
                 let nsLine = fullLine as NSString
                 var searchRange = NSRange(location: 0, length: nsLine.length)
@@ -513,18 +528,23 @@ struct LogTextView: NSViewRepresentable {
                     searchRange.length = nsLine.length - searchRange.location
                 }
                 attributedString.append(mutableLine)
-            } else {
-                attributedString.append(NSAttributedString(
-                    string: line + "\n",
-                    attributes: [.font: defaultFont, .foregroundColor: color]
-                ))
+            }
+            else {
+                attributedString.append(
+                    NSAttributedString(
+                        string: line + "\n",
+                        attributes: [.font: defaultFont, .foregroundColor: color],
+                    )
+                )
             }
         }
 
         if textView.attributedString() != attributedString {
             let wasAtBottom = context.coordinator.isFirstUpdate || isScrolledToBottom(scrollView)
             context.coordinator.wasAtBottom = autoScroll && wasAtBottom
-            textView.textStorage?.setAttributedString(attributedString)
+            // `textStorage` is `unowned(unsafe)` in AppKit. The text view owns its storage for as
+            // long as the view lives, and the view is alive here, on the main actor, for this call.
+            unsafe textView.textStorage?.setAttributedString(attributedString)
 
             if autoScroll && wasAtBottom {
                 textView.scrollToEndOfDocument(nil)
@@ -543,7 +563,8 @@ struct LogTextView: NSViewRepresentable {
 
     private func isScrolledToBottom(_ scrollView: NSScrollView) -> Bool {
         let clipView = scrollView.contentView
-        let documentView = scrollView.documentView!
+        // With no document there's nothing to scroll, so it reads as already at the bottom.
+        guard let documentView = scrollView.documentView else { return true }
         let currentScroll = clipView.bounds.origin.y + clipView.bounds.height
         let documentHeight = documentView.frame.height
         return currentScroll >= documentHeight - 50
@@ -552,9 +573,11 @@ struct LogTextView: NSViewRepresentable {
     private func colorForLine(_ line: String) -> NSColor {
         if line.contains("[stderr]") || line.lowercased().contains("error") {
             return NSColor.systemRed
-        } else if line.lowercased().contains("warn") {
+        }
+        else if line.lowercased().contains("warn") {
             return NSColor.systemOrange
-        } else if line.hasPrefix("[system]") {
+        }
+        else if line.hasPrefix("[system]") {
             return NSColor.systemBlue
         }
         return NSColor.labelColor

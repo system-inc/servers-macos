@@ -10,7 +10,10 @@ import Foundation
 /// `/bin/ps` children: the old CPU sampler waited before reading, and on a Mac with a few
 /// thousand processes the table no longer fit in the pipe. A child that runs past its deadline
 /// is killed, which closes its end of the pipe, and is then reaped like any other.
-enum HelperCommand {
+///
+/// Nonisolated because it runs on background queues, and so the watchdog closure is too: it
+/// fires on a global queue, and a closure that inherited the main actor would trap there.
+nonisolated enum HelperCommand {
     /// The child's standard output, or nil when it couldn't launch or was killed at its deadline.
     static func output(_ executablePath: String, arguments: [String], timeout: TimeInterval = 5) -> Data? {
         let process = Process()

@@ -1,12 +1,16 @@
 import AppKit
-import SwiftUI
 import Combine
 import ServiceManagement
+import SwiftUI
+import os
 
 // MARK: - Settings Window Controller
 
 class SettingsWindowController {
     private static var window: NSWindow?
+
+    /// `NSWindow.delegate` is weak, so the controller keeps the settings window's delegate alive.
+    private static let windowDelegate = SettingsWindowDelegate()
 
     static func show() {
         // If window already exists, bring it to front
@@ -28,7 +32,8 @@ class SettingsWindowController {
             let x = screenFrame.origin.x + (screenFrame.width - width) / 2
             let y = screenFrame.origin.y + (screenFrame.height - height) / 2
             defaultFrame = NSRect(x: x, y: y, width: width, height: height)
-        } else {
+        }
+        else {
             defaultFrame = NSRect(x: 0, y: 0, width: 680, height: 600)
         }
 
@@ -36,7 +41,7 @@ class SettingsWindowController {
             contentRect: defaultFrame,
             styleMask: [.titled, .closable, .resizable, .miniaturizable],
             backing: .buffered,
-            defer: false
+            defer: false,
         )
 
         win.minSize = NSSize(width: 560, height: 400)
@@ -48,9 +53,7 @@ class SettingsWindowController {
         _ = WindowStateManager.restore(window: win, name: "SettingsWindow")
 
         // Handle window close + save state
-        let delegate = SettingsWindowDelegate()
-        win.delegate = delegate
-        objc_setAssociatedObject(win, "delegate", delegate, .OBJC_ASSOCIATION_RETAIN)
+        win.delegate = windowDelegate
 
         window = win
         win.makeKeyAndOrderFront(nil)
@@ -86,7 +89,6 @@ class SettingsWindowController {
     }
 }
 
-
 // MARK: - Settings Content View
 
 struct SettingsContentView: View {
@@ -120,7 +122,7 @@ class SettingsViewModel: ObservableObject {
     @Published var launchAtLogin: Bool = false
     private var savedApiPortString: String = "7378"
     @Published var editingServerId: String? = nil
-    @Published var editDraft: ServerEditDraft = ServerEditDraft()
+    @Published var editDraft = ServerEditDraft()
     @Published var isAddingNew: Bool = false
 
     init() {
@@ -130,9 +132,9 @@ class SettingsViewModel: ObservableObject {
     func load() {
         if let settings = ServerSettings.load() {
             servers = settings.servers
-            let portStr = String(settings.resolvedApiPort)
-            savedApiPortString = portStr
-            apiPortString = portStr
+            let portString = String(settings.resolvedApiPort)
+            savedApiPortString = portString
+            apiPortString = portString
             apiPortDirty = false
         }
         launchAtLogin = SMAppService.mainApp.status == .enabled
@@ -156,12 +158,14 @@ class SettingsViewModel: ObservableObject {
             if SMAppService.mainApp.status == .enabled {
                 try SMAppService.mainApp.unregister()
                 launchAtLogin = false
-            } else {
+            }
+            else {
                 try SMAppService.mainApp.register()
                 launchAtLogin = true
             }
-        } catch {
-            print("Failed to toggle launch at login: \(error)")
+        }
+        catch {
+            Logger.settings.error("Failed to toggle launch at login: \(error, privacy: .public)")
         }
     }
 
@@ -177,9 +181,16 @@ class SettingsViewModel: ObservableObject {
         let server = servers[index]
         let newVisible = !server.isVisible
         servers[index] = Server(
-            id: server.id, name: server.name, path: server.path, command: server.command,
-            port: server.port, hostname: server.hostname, healthCheckPath: server.healthCheckPath,
-            https: server.https, autoStart: server.autoStart, visible: newVisible
+            id: server.id,
+            name: server.name,
+            path: server.path,
+            command: server.command,
+            port: server.port,
+            hostname: server.hostname,
+            healthCheckPath: server.healthCheckPath,
+            https: server.https,
+            autoStart: server.autoStart,
+            visible: newVisible,
         )
         save()
     }
@@ -208,8 +219,10 @@ class SettingsViewModel: ObservableObject {
 
         if isAddingNew {
             servers.append(newServer)
-        } else if let editingId = editingServerId,
-                  let index = servers.firstIndex(where: { $0.id == editingId }) {
+        }
+        else if let editingId = editingServerId,
+            let index = servers.firstIndex(where: { $0.id == editingId })
+        {
             servers[index] = newServer
         }
 
@@ -258,7 +271,7 @@ struct ServerEditDraft {
         command = server.command
         path = server.path
         hostname = server.hostname
-        port = server.port != nil ? String(server.port!) : ""
+        port = server.port.map { String($0) } ?? ""
         https = server.useHttps
         healthCheckPath = server.healthCheckPath ?? "/"
         autoStart = server.shouldAutoStart
@@ -266,10 +279,8 @@ struct ServerEditDraft {
     }
 
     var isValid: Bool {
-        !name.trimmingCharacters(in: .whitespaces).isEmpty &&
-        !command.trimmingCharacters(in: .whitespaces).isEmpty &&
-        !path.trimmingCharacters(in: .whitespaces).isEmpty &&
-        !id.trimmingCharacters(in: .whitespaces).isEmpty
+        !name.trimmingCharacters(in: .whitespaces).isEmpty && !command.trimmingCharacters(in: .whitespaces).isEmpty
+            && !path.trimmingCharacters(in: .whitespaces).isEmpty && !id.trimmingCharacters(in: .whitespaces).isEmpty
     }
 
     func toServer() -> Server {
@@ -283,7 +294,7 @@ struct ServerEditDraft {
             healthCheckPath: healthCheckPath.isEmpty ? "/" : healthCheckPath,
             https: https ? true : nil,
             autoStart: autoStart ? true : nil,
-            visible: visible ? nil : false
+            visible: visible ? nil : false,
         )
     }
 }
@@ -300,10 +311,13 @@ struct GeneralSettingsSection: View {
                 .foregroundStyle(.secondary)
 
             HStack(spacing: 16) {
-                Toggle("Launch at Login", isOn: Binding(
-                    get: { viewModel.launchAtLogin },
-                    set: { _ in viewModel.toggleLaunchAtLogin() }
-                ))
+                Toggle(
+                    "Launch at Login",
+                    isOn: Binding(
+                        get: { viewModel.launchAtLogin },
+                        set: { _ in viewModel.toggleLaunchAtLogin() },
+                    ),
+                )
                 .toggleStyle(.checkbox)
 
                 Spacer()
@@ -345,15 +359,23 @@ struct ServerListSection: View {
                     icon: "square.and.pencil",
                     label: "~/.servers/settings.json",
                     color: .gray,
-                    tooltip: "Open in VS Code"
+                    tooltip: "Open in VS Code",
                 ) {
                     let path = NSString(string: "~/.servers/settings.json").expandingTildeInPath
                     let task = Process()
-                    task.executableURL = URL(fileURLWithPath: "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code")
+                    task.executableURL = URL(
+                        fileURLWithPath: "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+                    )
                     task.arguments = [path]
                     task.standardOutput = FileHandle.nullDevice
                     task.standardError = FileHandle.nullDevice
-                    try? task.run()
+                    do {
+                        try task.run()
+                    }
+                    catch {
+                        // Without VS Code installed there's nothing to open; say so in the log.
+                        Logger.settings.error("Failed to open settings in VS Code: \(error, privacy: .public)")
+                    }
                 }
 
                 if !viewModel.isAddingNew && viewModel.editingServerId == nil {
@@ -369,8 +391,14 @@ struct ServerListSection: View {
                         if viewModel.editingServerId == server.id {
                             ServerEditForm(viewModel: viewModel, isNew: false)
                                 .padding(12)
-                        } else {
-                            ServerRow(server: server, index: index, serverCount: viewModel.servers.count, viewModel: viewModel)
+                        }
+                        else {
+                            ServerRow(
+                                server: server,
+                                index: index,
+                                serverCount: viewModel.servers.count,
+                                viewModel: viewModel,
+                            )
                         }
 
                         if index < viewModel.servers.count - 1 {
@@ -407,7 +435,7 @@ struct ServerRow: View {
     @State private var showDeleteConfirm = false
 
     private var portString: String {
-        server.port != nil ? ":" + String(server.port!) : ""
+        server.port.map { ":\($0)" } ?? ""
     }
 
     var body: some View {
@@ -451,7 +479,13 @@ struct ServerRow: View {
                     viewModel.moveServerUp(at: index)
                 }
 
-                ActionButton(icon: "chevron.down", color: .gray, enabled: index < serverCount - 1, size: .small, tooltip: "Move down") {
+                ActionButton(
+                    icon: "chevron.down",
+                    color: .gray,
+                    enabled: index < serverCount - 1,
+                    size: .small,
+                    tooltip: "Move down",
+                ) {
                     viewModel.moveServerDown(at: index)
                 }
 
@@ -460,7 +494,7 @@ struct ServerRow: View {
                     color: server.isVisible ? .blue : .gray,
                     enabled: true,
                     size: .small,
-                    tooltip: server.isVisible ? "Hide from menu" : "Show in menu"
+                    tooltip: server.isVisible ? "Hide from menu" : "Show in menu",
                 ) {
                     viewModel.toggleVisibility(at: index)
                 }
@@ -536,7 +570,8 @@ struct ServerEditForm: View {
                         let home = FileManager.default.homeDirectoryForCurrentUser.path
                         if url.path.hasPrefix(home) {
                             viewModel.editDraft.path = "~" + url.path.dropFirst(home.count)
-                        } else {
+                        }
+                        else {
                             viewModel.editDraft.path = url.path
                         }
                     }

@@ -1,5 +1,6 @@
-import SwiftUI
 import Darwin
+import SwiftUI
+import os
 
 @main
 struct ServersApp: App {
@@ -14,8 +15,8 @@ struct ServersApp: App {
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusBarController: StatusBarController?
-    private var sigtermSource: DispatchSourceSignal?
-    private var sigintSource: DispatchSourceSignal?
+    private var sigtermSource: (any DispatchSourceSignal)?
+    private var sigintSource: (any DispatchSourceSignal)?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusBarController = StatusBarController()
@@ -37,19 +38,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         signal(SIGTERM, SIG_IGN)
         signal(SIGINT, SIG_IGN)
 
-        // Handle SIGTERM (sent by pkill -TERM)
+        // Handle `SIGTERM` (sent by `pkill -TERM`)
         sigtermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
         sigtermSource?.setEventHandler { [weak self] in
-            print("[Servers] Received SIGTERM - shutting down gracefully...")
+            Logger.app.notice("Received SIGTERM, shutting down gracefully")
             self?.gracefulShutdown()
             exit(0)
         }
         sigtermSource?.resume()
 
-        // Handle SIGINT (Ctrl+C)
+        // Handle `SIGINT` (Ctrl+C)
         sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
         sigintSource?.setEventHandler { [weak self] in
-            print("[Servers] Received SIGINT - shutting down gracefully...")
+            Logger.app.notice("Received SIGINT, shutting down gracefully")
             self?.gracefulShutdown()
             exit(0)
         }
@@ -57,7 +58,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func gracefulShutdown() {
-        print("[Servers] Stopping all servers...")
+        Logger.app.notice("Stopping all servers")
 
         // Stop the API server
         statusBarController?.serverApi?.stop()
@@ -68,7 +69,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Give processes a moment to die
         Thread.sleep(forTimeInterval: 0.5)
 
-        print("[Servers] Shutdown complete.")
+        Logger.app.notice("Shutdown complete")
     }
 }
 

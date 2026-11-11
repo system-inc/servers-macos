@@ -1,5 +1,6 @@
-import Foundation
 import Combine
+import Foundation
+import os
 
 // MARK: - Server Model
 
@@ -31,7 +32,24 @@ struct Server: Codable, Identifiable {
         visible ?? true
     }
 
-    init(id: String, name: String, path: String, command: String, port: Int? = nil, hostname: String, healthCheckPath: String? = nil, https: Bool? = nil, autoStart: Bool? = nil, visible: Bool? = nil) {
+    /// Where the server answers in a browser. Nil without a port, or when the hostname can't form a URL.
+    var browserUrl: URL? {
+        guard let port else { return nil }
+        return URL(string: "\(useHttps ? "https" : "http")://\(hostname):\(port)")
+    }
+
+    init(
+        id: String,
+        name: String,
+        path: String,
+        command: String,
+        port: Int? = nil,
+        hostname: String,
+        healthCheckPath: String? = nil,
+        https: Bool? = nil,
+        autoStart: Bool? = nil,
+        visible: Bool? = nil,
+    ) {
         self.id = id
         self.name = name
         self.path = path
@@ -65,13 +83,13 @@ class ServerState: ObservableObject {
 
     var process: Process?
     var pid: pid_t = 0
-    @Published var cpuUsage: Double = 0  // Total CPU % for process tree
+    @Published var cpuUsage: Double = 0 // Total CPU % for process tree
     @Published var logBuffer: [String] = []
     @Published var logTimestamps: [Date] = []
     var crashTimes: [Date] = []
 
-    let maxLogLines = 5000
-    let maxCrashesBeforeCooldown = 3
+    let maximumLogLines = 5000
+    let maximumCrashesBeforeCooldown = 3
     let crashWindowSeconds: TimeInterval = 60
     let cooldownSeconds: TimeInterval = 300
     var inCooldown = false
@@ -89,8 +107,8 @@ class ServerState: ObservableObject {
     func appendLog(_ line: String) {
         logBuffer.append(line)
         logTimestamps.append(Date())
-        if logBuffer.count > maxLogLines {
-            let overflow = logBuffer.count - maxLogLines
+        if logBuffer.count > maximumLogLines {
+            let overflow = logBuffer.count - maximumLogLines
             logBuffer.removeFirst(overflow)
             logTimestamps.removeFirst(overflow)
         }
@@ -123,28 +141,33 @@ struct ServerSettings: Codable {
         let path = NSString(string: defaultSettingsPath).expandingTildeInPath
 
         guard let data = FileManager.default.contents(atPath: path) else {
-            print("Error: No settings file found at \(path)")
+            Logger.settings.error("No settings file found at \(path, privacy: .public)")
             return nil
         }
 
         do {
             return try JSONDecoder().decode(ServerSettings.self, from: data)
-        } catch {
-            print("Error: Failed to parse settings file: \(error)")
+        }
+        catch {
+            Logger.settings.error("Failed to parse settings file: \(error, privacy: .public)")
             return nil
         }
     }
 
     func save() {
         let path = NSString(string: ServerSettings.defaultSettingsPath).expandingTildeInPath
-        let dir = (path as NSString).deletingLastPathComponent
-
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let directory = (path as NSString).deletingLastPathComponent
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let data = try? encoder.encode(self) {
-            try? data.write(to: URL(fileURLWithPath: path))
+        do {
+            try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+            try encoder.encode(self).write(to: URL(fileURLWithPath: path))
+        }
+        catch {
+            // The settings window keeps its edits in memory, so a failed write loses nothing yet;
+            // the reload that follows reads back what is on disk.
+            Logger.settings.error("Failed to save settings to \(path, privacy: .public): \(error, privacy: .public)")
         }
     }
 }
@@ -171,9 +194,36 @@ struct LogsResponse: Codable {
     let totalLines: Int
 }
 
-struct ActionResponse: Codable {
-    let success: Bool
-    let message: String
+/// How a control request (start, stop, restart, clear logs, reload) turned out.
+///
+/// On the wire it is `{"message": String, "success": Bool}`, the shape agents and scripts read.
+enum ActionOutcome: Encodable {
+    case accepted(message: String)
+    case serverNotFound
+
+    var httpStatus: Int {
+        switch self {
+            case .accepted: 200
+            case .serverNotFound: 404
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case success
+        case message
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+            case .accepted(let message):
+                try container.encode(true, forKey: .success)
+                try container.encode(message, forKey: .message)
+            case .serverNotFound:
+                try container.encode(false, forKey: .success)
+                try container.encode("Server not found", forKey: .message)
+        }
+    }
 }
 
 struct AppStats: Codable {

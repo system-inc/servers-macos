@@ -1,6 +1,6 @@
 import AppKit
-import SwiftUI
 import Combine
+import SwiftUI
 
 class StatusBarController: ObservableObject {
     private var statusItem: NSStatusItem
@@ -14,7 +14,7 @@ class StatusBarController: ObservableObject {
     // Menu items we need to update dynamically
     private var serverLabelItems: [String: NSMenuItem] = [:]
     private var serverButtonItems: [String: NSMenuItem] = [:]
-    private var settingsObserver: NSObjectProtocol?
+    private var settingsObserver: (any NSObjectProtocol)?
 
     init() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -39,13 +39,18 @@ class StatusBarController: ObservableObject {
 
         // Subscribe to settings changes to rebuild menu
         settingsObserver = NotificationCenter.default.addObserver(
-            forName: .serverSettingsDidChange, object: nil, queue: .main
+            forName: .serverSettingsDidChange,
+            object: nil,
+            queue: .main,
         ) { [weak self] _ in
-            self?.rebuildMenu()
+            // Registered on the main queue, so it's delivered there.
+            MainActor.assumeIsolated {
+                self?.rebuildMenu()
+            }
         }
     }
 
-    deinit {
+    isolated deinit {
         serverApi?.stop()
         serverManager.forceStopAll()
     }
@@ -53,7 +58,7 @@ class StatusBarController: ObservableObject {
     private func setupStatusBarButton() {
         if let button = statusItem.button {
             let image = NSImage(systemSymbolName: "server.rack", accessibilityDescription: "Servers")
-            image?.isTemplate = true  // Adapts to light/dark mode
+            image?.isTemplate = true // Adapts to light/dark mode
             button.image = image
         }
         statusItem.menu = menu
@@ -73,7 +78,7 @@ class StatusBarController: ObservableObject {
 
         menu.addItem(NSMenuItem.separator())
 
-        // Server items — only visible servers
+        // Server items, only the visible ones
         if let settings = serverManager.settings {
             let visibleServers = settings.servers.filter { $0.isVisible }
             for server in visibleServers {
@@ -84,7 +89,8 @@ class StatusBarController: ObservableObject {
                 menu.addItem(buttonItem)
                 menu.addItem(NSMenuItem.separator())
             }
-        } else if let error = serverManager.configError {
+        }
+        else if let error = serverManager.configurationError {
             let errorItem = NSMenuItem(title: "\(error)", action: nil, keyEquivalent: "")
             errorItem.isEnabled = false
             menu.addItem(errorItem)
@@ -115,24 +121,21 @@ class StatusBarController: ObservableObject {
         let state = serverManager.serverStates[server.id]
         let status = state?.status ?? .stopped
 
-        // Row 1: Clickable label — opens control window
+        // Row 1: Clickable label (a tap gesture inside the SwiftUI view), opens the log window
         let labelItem = NSMenuItem()
-        let portSuffix = server.port != nil ? ":" + String(server.port!) : ""
-        let labelView = ServerLabelView(name: server.name, port: portSuffix, status: status)
+        let labelView = ServerLabelView(
+            name: server.name,
+            port: server.port.map { ":\($0)" } ?? "",
+            status: status,
+            cpuUsage: state?.cpuUsage,
+            onTap: { [weak self] in
+                self?.menu.cancelTracking()
+                LogWindowController.show(serverId: server.id, manager: self?.serverManager ?? ServerManager.shared)
+            },
+        )
         let labelHosting = NSHostingView(rootView: labelView)
         labelHosting.frame = NSRect(x: 0, y: 0, width: 280, height: 26)
         labelItem.view = labelHosting
-
-        // Make the whole label clickable via a gesture inside the SwiftUI view
-        // We'll use a tap gesture in ServerLabelView instead
-        let cpuUsage = state?.cpuUsage
-        let labelViewWithAction = ServerLabelView(name: server.name, port: portSuffix, status: status, cpuUsage: cpuUsage, onTap: { [weak self] in
-            self?.menu.cancelTracking()
-            LogWindowController.show(serverId: server.id, manager: self?.serverManager ?? ServerManager.shared)
-        })
-        let labelHostingFinal = NSHostingView(rootView: labelViewWithAction)
-        labelHostingFinal.frame = NSRect(x: 0, y: 0, width: 280, height: 26)
-        labelItem.view = labelHostingFinal
 
         // Row 2: Buttons
         let buttonItem = NSMenuItem()
@@ -142,19 +145,21 @@ class StatusBarController: ObservableObject {
             onStart: { [weak self] in self?.serverManager.start(serverId: server.id) },
             onStop: { [weak self] in self?.serverManager.stop(serverId: server.id) },
             onRestart: { [weak self] in self?.serverManager.restart(serverId: server.id) },
-            onOpenBrowser: server.port != nil ? { [weak self] in
-                self?.menu.cancelTracking()
-                let scheme = server.useHttps ? "https" : "http"
-                let hostname = server.hostname
-                if let url = URL(string: "\(scheme)://\(hostname):\(server.port!)") {
-                    NSWorkspace.shared.open(url)
-                }
-            } : nil,
+            onOpenBrowser: server.port != nil
+                ? { [weak self] in
+                    self?.menu.cancelTracking()
+                    if let url = server.browserUrl {
+                        NSWorkspace.shared.open(url)
+                    }
+                } : nil,
             onCopyInstructions: {
                 ServerInstructions.copyToClipboard(for: server, apiPort: apiPort)
-            }
+            },
         )
-        let wrappedButtons = buttonsView.padding(.horizontal, 14).padding(.vertical, 4).frame(width: 280, alignment: .leading)
+        let wrappedButtons = buttonsView.padding(.horizontal, 14).padding(.vertical, 4).frame(
+            width: 280,
+            alignment: .leading,
+        )
         let buttonHosting = NSHostingView(rootView: wrappedButtons)
         buttonHosting.frame = NSRect(x: 0, y: 0, width: 280, height: 30)
         buttonItem.view = buttonHosting
@@ -180,11 +185,17 @@ class StatusBarController: ObservableObject {
 
         // Update label
         if let labelItem = serverLabelItems[id] {
-            let portSuffix = server.port != nil ? ":" + String(server.port!) : ""
-            let labelView = ServerLabelView(name: server.name, port: portSuffix, status: status, cpuUsage: cpuUsage, onTap: { [weak self] in
-                self?.menu.cancelTracking()
-                LogWindowController.show(serverId: server.id, manager: self?.serverManager ?? ServerManager.shared)
-            })
+            let portSuffix = server.port.map { ":\($0)" } ?? ""
+            let labelView = ServerLabelView(
+                name: server.name,
+                port: portSuffix,
+                status: status,
+                cpuUsage: cpuUsage,
+                onTap: { [weak self] in
+                    self?.menu.cancelTracking()
+                    LogWindowController.show(serverId: server.id, manager: self?.serverManager ?? ServerManager.shared)
+                },
+            )
             let hosting = NSHostingView(rootView: labelView)
             hosting.frame = NSRect(x: 0, y: 0, width: 280, height: 26)
             labelItem.view = hosting
@@ -198,19 +209,21 @@ class StatusBarController: ObservableObject {
                 onStart: { [weak self] in self?.serverManager.start(serverId: server.id) },
                 onStop: { [weak self] in self?.serverManager.stop(serverId: server.id) },
                 onRestart: { [weak self] in self?.serverManager.restart(serverId: server.id) },
-                onOpenBrowser: server.port != nil ? { [weak self] in
-                    self?.menu.cancelTracking()
-                    let scheme = server.useHttps ? "https" : "http"
-                    let hostname = server.hostname
-                    if let url = URL(string: "\(scheme)://\(hostname):\(server.port!)") {
-                        NSWorkspace.shared.open(url)
-                    }
-                } : nil,
+                onOpenBrowser: server.port != nil
+                    ? { [weak self] in
+                        self?.menu.cancelTracking()
+                        if let url = server.browserUrl {
+                            NSWorkspace.shared.open(url)
+                        }
+                    } : nil,
                 onCopyInstructions: {
                     ServerInstructions.copyToClipboard(for: server, apiPort: apiPort)
-                }
+                },
             )
-            let wrappedButtons = buttonsView.padding(.horizontal, 14).padding(.vertical, 4).frame(width: 280, alignment: .leading)
+            let wrappedButtons = buttonsView.padding(.horizontal, 14).padding(.vertical, 4).frame(
+                width: 280,
+                alignment: .leading,
+            )
             let hosting = NSHostingView(rootView: wrappedButtons)
             hosting.frame = NSRect(x: 0, y: 0, width: 280, height: 30)
             buttonItem.view = hosting
@@ -248,7 +261,7 @@ struct MenuHeaderView: View {
                     Text("App")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
-                    Text(String(format: "%.0f%%", cpu))
+                    Text(CpuPercentText.whole(cpu))
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(cpu > 100 ? .red : .orange)
                 }
@@ -265,40 +278,37 @@ struct MenuHeaderView: View {
 
 enum ServerInstructions {
     static func markdown(for server: Server, apiPort: Int = 7378) -> String {
-        let scheme = server.useHttps ? "https" : "http"
-        let portStr = server.port != nil ? ":\(server.port!)" : ""
-        let url = server.port != nil ? "\(scheme)://\(server.hostname)\(portStr)" : nil
+        let url = server.browserUrl?.absoluteString
         let base = "http://localhost:\(apiPort)"
-        let s = "\(base)/servers/\(server.id)"
+        let serverEndpoint = "\(base)/servers/\(server.id)"
 
-        var md = "# \(server.name)\n\n"
-        md += "Managed by **Servers.app**, a macOS menubar app for local dev servers. "
-        md += "All servers can be controlled via a REST API on port \(apiPort).\n\n"
+        var instructions = "# \(server.name)\n\n"
+        instructions += "Managed by **Servers.app**, a macOS menubar app for local dev servers. "
+        instructions += "All servers can be controlled via a REST API on port \(apiPort).\n\n"
 
-        if let url = url {
-            md += "**URL:** \(url)\n"
+        if let url {
+            instructions += "**URL:** \(url)\n"
         }
-        md += "**Path:** `\(server.path)`\n"
+        instructions += "**Path:** `\(server.path)`\n"
 
-        md += """
+        instructions += """
 
-        ```bash
-        curl \(s)                  # status
-        curl \(s)/logs?lines=200   # logs
-        curl -X POST \(s)/start    # start
-        curl -X POST \(s)/stop     # stop
-        curl -X POST \(s)/restart  # restart
-        curl \(base)/servers              # all servers
-        ```
-        """
+            ```bash
+            curl \(serverEndpoint)                  # status
+            curl \(serverEndpoint)/logs?lines=200   # logs
+            curl -X POST \(serverEndpoint)/start    # start
+            curl -X POST \(serverEndpoint)/stop     # stop
+            curl -X POST \(serverEndpoint)/restart  # restart
+            curl \(base)/servers              # all servers
+            ```
+            """
 
-        return md
+        return instructions
     }
 
     static func copyToClipboard(for server: Server, apiPort: Int = 7378) {
-        let md = markdown(for: server, apiPort: apiPort)
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(md, forType: .string)
+        NSPasteboard.general.setString(markdown(for: server, apiPort: apiPort), forType: .string)
     }
 }
 
@@ -329,7 +339,8 @@ struct ServerControlButtons: View {
                 ActionButton(icon: "play.fill", color: .green, enabled: true, size: size, tooltip: "Start") {
                     onStart()
                 }
-            } else {
+            }
+            else {
                 ActionButton(icon: "stop.fill", color: .red, enabled: true, size: size, tooltip: "Stop") {
                     onStop()
                 }
@@ -345,7 +356,7 @@ struct ServerControlButtons: View {
                     color: showCopied ? .green : .purple,
                     enabled: true,
                     size: size,
-                    tooltip: "Copy Instructions"
+                    tooltip: "Copy Instructions",
                 ) {
                     onCopyInstructions()
                     showCopied = true
@@ -382,7 +393,7 @@ struct ServerLabelView: View {
                 .lineLimit(1)
 
             if let cpu = cpuUsage, status == .running, cpu > 50 {
-                Text(formatCpu(cpu))
+                Text(CpuPercentText.adaptive(cpu))
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(cpuColor(cpu))
             }
@@ -404,17 +415,28 @@ struct ServerLabelView: View {
         .onTapGesture { onTap?() }
     }
 
-    private func formatCpu(_ cpu: Double) -> String {
-        if cpu < 10 {
-            return String(format: "%.1f%%", cpu)
-        }
-        return String(format: "%.0f%%", cpu)
-    }
-
     private func cpuColor(_ cpu: Double) -> Color {
         if cpu > 100 { return .red }
         if cpu > 50 { return .orange }
         return .secondary
+    }
+}
+
+// MARK: - CPU Percent Text
+
+enum CpuPercentText {
+    /// Whole percent, as in "142%".
+    static func whole(_ cpu: Double) -> String {
+        text(cpu, fractionDigits: 0)
+    }
+
+    /// One decimal under 10%, whole above, as in "3.5%" and "142%".
+    static func adaptive(_ cpu: Double) -> String {
+        text(cpu, fractionDigits: cpu < 10 ? 1 : 0)
+    }
+
+    private static func text(_ cpu: Double, fractionDigits: Int) -> String {
+        cpu.formatted(.number.precision(.fractionLength(fractionDigits)).grouping(.never)) + "%"
     }
 }
 
@@ -426,22 +448,22 @@ struct ActionButton: View {
 
         var iconSize: CGFloat {
             switch self {
-            case .small: return 11
-            case .medium: return 13
+                case .small: return 11
+                case .medium: return 13
             }
         }
 
         var frameWidth: CGFloat {
             switch self {
-            case .small: return 28
-            case .medium: return 32
+                case .small: return 28
+                case .medium: return 32
             }
         }
 
         var frameHeight: CGFloat {
             switch self {
-            case .small: return 22
-            case .medium: return 26
+                case .small: return 22
+                case .medium: return 26
             }
         }
     }
@@ -490,7 +512,8 @@ struct ActionButton: View {
         guard enabled else { return .clear }
         if isPressed {
             return color.opacity(0.7)
-        } else if isHovered {
+        }
+        else if isHovered {
             return color.opacity(0.6)
         }
         return color.opacity(0.1)
@@ -554,7 +577,8 @@ struct LabeledActionButton: View {
     private var backgroundColor: Color {
         if isPressed {
             return color.opacity(0.7)
-        } else if isHovered {
+        }
+        else if isHovered {
             return color.opacity(0.6)
         }
         return color.opacity(0.1)
