@@ -63,11 +63,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Stop the API server
         statusBarController?.serverApi?.stop()
 
-        // Stop all managed dev servers (this kills the process groups)
-        ServerManager.shared.stopAll()
-
-        // Give processes a moment to die
-        Thread.sleep(forTimeInterval: 0.5)
+        // Kill every managed dev server's process group now and clear their ports. Not stopAll():
+        // its one-second `SIGKILL` fallback runs on the main queue, which never turns again
+        // before exit, so a server that ignores `SIGTERM` would outlive the app.
+        ServerManager.shared.forceStopAll()
 
         Logger.app.notice("Shutdown complete")
     }
