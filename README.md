@@ -41,16 +41,16 @@ Settings are stored in `~/.servers/settings.json`:
 
 ### Server Options
 
-| Option | Required | Description |
-|--------|----------|-------------|
-| `id` | Yes | Unique identifier |
-| `name` | Yes | Display name in menu |
-| `path` | Yes | Working directory (supports `~`) |
-| `command` | Yes | Command to run |
-| `port` | No | Port for health checks and "Open in Browser" |
-| `healthCheckPath` | No | Path for health checks (default: `/`) |
-| `https` | No | Use HTTPS for health checks (default: `false`) |
-| `autoStart` | No | Start automatically on launch (default: `false`) |
+| Option            | Required | Description                                      |
+| ----------------- | -------- | ------------------------------------------------ |
+| `id`              | Yes      | Unique identifier                                |
+| `name`            | Yes      | Display name in menu                             |
+| `path`            | Yes      | Working directory (supports `~`)                 |
+| `command`         | Yes      | Command to run                                   |
+| `port`            | No       | Port for health checks and "Open in Browser"     |
+| `healthCheckPath` | No       | Path for health checks (default: `/`)            |
+| `https`           | No       | Use HTTPS for health checks (default: `false`)   |
+| `autoStart`       | No       | Start automatically on launch (default: `false`) |
 
 ## API
 
