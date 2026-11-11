@@ -25,3 +25,6 @@ Icon/SfServerRack-Medium.png
 Icon/SfServerRack-Regular.png
 Icon/SfServerRack-Semibold.png
 Icon/SfServerRack.png
+
+# cohere
+.cache/
