@@ -15,6 +15,10 @@ class ServerManager: ObservableObject {
 
     private var healthCheckTimers: [String: Timer] = [:]
     private var cpuMonitorTimer: Timer?
+    // Main-thread only. A tick that lands while the last sample is still out skips, so a slow
+    // ps can never stack up children behind it.
+    private var cpuSampleInFlight = false
+
     private func nodeEnvPath(for projectPath: String) -> String {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let nvmDir = "\(home)/.nvm/versions/node"
@@ -101,6 +105,8 @@ class ServerManager: ObservableObject {
     }
 
     private func sampleCpuUsage() {
+        guard !cpuSampleInFlight else { return }
+
         // Collect all PIDs we care about (running servers + self)
         var pidToServerId: [pid_t: String] = [:]
         for (id, state) in serverStates where state.pid > 0 && state.status == .running {
@@ -114,26 +120,17 @@ class ServerManager: ObservableObject {
         }
 
         // Use ps to get CPU for all processes, then sum by process tree
+        cpuSampleInFlight = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self = self else { return }
 
-            // Get all processes with pid, ppid, %cpu
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: "/bin/ps")
-            task.arguments = ["-eo", "pid,ppid,%cpu"]
-            let pipe = Pipe()
-            task.standardOutput = pipe
-            task.standardError = FileHandle.nullDevice
-
-            do {
-                try task.run()
-                task.waitUntilExit()
-            } catch {
+            // Get all processes with pid, ppid, %cpu. The table runs to tens of kilobytes on a
+            // busy Mac, past the pipe buffer, which is why this goes through HelperCommand.
+            guard let data = HelperCommand.output("/bin/ps", arguments: ["-eo", "pid,ppid,%cpu"]),
+                  let output = String(data: data, encoding: .utf8) else {
+                DispatchQueue.main.async { self.cpuSampleInFlight = false }
                 return
             }
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard let output = String(data: data, encoding: .utf8) else { return }
 
             // Parse ps output into (pid, ppid, cpu) tuples
             struct PsEntry {
@@ -183,6 +180,7 @@ class ServerManager: ObservableObject {
             let selfCpu = cpuOf[appPid] ?? 0
 
             DispatchQueue.main.async {
+                self.cpuSampleInFlight = false
                 for (serverId, cpu) in results {
                     self.serverStates[serverId]?.cpuUsage = cpu
                 }
@@ -197,26 +195,19 @@ class ServerManager: ObservableObject {
     }
 
     private func sampleAppCpu() {
+        cpuSampleInFlight = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let appPid = ProcessInfo.processInfo.processIdentifier
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: "/bin/ps")
-            task.arguments = ["-p", "\(appPid)", "-o", "%cpu"]
-            let pipe = Pipe()
-            task.standardOutput = pipe
-            task.standardError = FileHandle.nullDevice
+            var cpu: Double?
+            if let data = HelperCommand.output("/bin/ps", arguments: ["-p", "\(appPid)", "-o", "%cpu"]),
+               let output = String(data: data, encoding: .utf8),
+               let line = output.components(separatedBy: "\n").dropFirst().first {
+                cpu = Double(line.trimmingCharacters(in: .whitespaces))
+            }
 
-            do {
-                try task.run()
-                task.waitUntilExit()
-            } catch { return }
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard let output = String(data: data, encoding: .utf8) else { return }
-
-            let lines = output.components(separatedBy: "\n").dropFirst()
-            if let line = lines.first, let cpu = Double(line.trimmingCharacters(in: .whitespaces)) {
-                DispatchQueue.main.async {
+            DispatchQueue.main.async {
+                self?.cpuSampleInFlight = false
+                if let cpu = cpu {
                     self?.appCpuUsage = cpu
                 }
             }
@@ -455,33 +446,20 @@ class ServerManager: ObservableObject {
 
     @discardableResult
     private func killProcessesOnPort(_ port: Int) -> [Int32] {
-        // Get PIDs using lsof synchronously
-        let pipe = Pipe()
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
-        task.arguments = ["-ti", ":\(port)"]
-        task.standardOutput = pipe
-        task.standardError = FileHandle.nullDevice
-
-        do {
-            try task.run()
-            task.waitUntilExit()
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            if let output = String(data: data, encoding: .utf8) {
-                // Parse PIDs and kill each one directly
-                let pids = output.components(separatedBy: .newlines)
-                    .compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
-
-                for pid in pids {
-                    kill(pid, SIGKILL)
-                }
-                return pids
-            }
-        } catch {
-            // Ignore errors - no process on port is fine
+        // Get PIDs using lsof synchronously. No output (nothing on the port, or lsof failed) is fine.
+        guard let data = HelperCommand.output("/usr/sbin/lsof", arguments: ["-ti", ":\(port)"]),
+              let output = String(data: data, encoding: .utf8) else {
+            return []
         }
-        return []
+
+        // Parse PIDs and kill each one directly
+        let pids = output.components(separatedBy: .newlines)
+            .compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
+
+        for pid in pids {
+            kill(pid, SIGKILL)
+        }
+        return pids
     }
 
     // MARK: - Log Access
@@ -563,19 +541,9 @@ class ServerManager: ObservableObject {
         let escapedPath = NSRegularExpression.escapedPattern(for: server.expandedPath)
         let pattern = "\(escapedPath).*\(escapedCommand)(\\s|$)"
 
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        task.arguments = ["-9", "-f", pattern]
-        task.standardOutput = FileHandle.nullDevice
-        task.standardError = FileHandle.nullDevice
-
-        do {
-            try task.run()
-            task.waitUntilExit()
-            Thread.sleep(forTimeInterval: 0.3)
-        } catch {
-            // Ignore - no matching process is fine
-        }
+        // No matching process is fine (pkill exits 1); nil means it couldn't launch or hung
+        guard HelperCommand.output("/usr/bin/pkill", arguments: ["-9", "-f", pattern]) != nil else { return }
+        Thread.sleep(forTimeInterval: 0.3)
     }
 
     private func handleCrash(state: ServerState) {
